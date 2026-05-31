@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
@@ -259,3 +260,110 @@ def find_duplicates(
                 pairs.append((a, b, s))
     pairs.sort(key=lambda p: -p[2])
     return pairs
+
+
+# ---------- sparse (BM25 via FTS5) + hybrid fusion ----------
+
+def _sanitize_fts_query(text: str) -> str:
+    """Turn raw question text into a safe FTS5 MATCH expression.
+
+    Raw text contains characters FTS5 treats as operators (quotes, ``*``,
+    ``:``, and the bareword operators AND/OR/NEAR), which would error or
+    misparse. Tokenize to word chars, double-quote each token (so each is a
+    literal, not an operator), and join with ``OR``. ``OR`` (not implicit
+    AND) is deliberate: AND requires every term present and destroys recall
+    on long questions. Empty input -> a query that matches nothing.
+    """
+    tokens = re.findall(r"\w+", text.lower())
+    if not tokens:
+        return '""'
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def bm25_search(
+    text: str,
+    k: int,
+    *,
+    db_path: str | Path | None = None,
+) -> list[str]:
+    """Top-k qids by BM25 over the FTS5 index, most relevant first.
+
+    SQLite's bm25() returns NEGATIVE scores (more negative = more relevant),
+    so we ORDER BY ... ASC to put the best matches on top.
+    """
+    match = _sanitize_fts_query(text)
+    sql = (
+        "SELECT qid FROM questions_fts WHERE questions_fts MATCH ? "
+        "ORDER BY bm25(questions_fts) ASC LIMIT ?"
+    )
+    with _connect(db_path) as conn:
+        rows = conn.execute(sql, (match, k)).fetchall()
+    return [r["qid"] for r in rows]
+
+
+def hybrid_search(
+    qid_or_text: str,
+    *,
+    k: int = 10,
+    exclude_ids: set[str] | None = None,
+    kk: int = 60,
+    overfetch: int = 50,
+    db_path: str | Path | None = None,
+    index_path: str | None = None,
+    ids_path: str | None = None,
+) -> list[tuple[str, float]]:
+    """Dense (FAISS) + sparse (BM25) retrieval fused with Reciprocal Rank Fusion.
+
+    Mirrors ``similar_to``'s output shape: ``[(qid, rrf_score)]`` truncated to k.
+
+    RRF fuses on RANK ONLY -- the two score scales (cosine 0..1 vs bm25
+    negative) are discarded, sidestepping any need to normalize across them:
+        score(q) = sum over lists of 1 / (kk + rank)   # rank is 1-based
+    kk=60 is the standard constant (Cormack et al., 2009).
+    """
+    _, _, id_to_row = load_index(index_path, ids_path)
+    exclude = set(exclude_ids) if exclude_ids else set()
+
+    # Resolve the sparse-side query text. If the arg is a stored id, reuse it
+    # for both sides: dense reconstructs the stored vector (via similar_to),
+    # sparse uses the SAME composed string that was embedded/indexed.
+    input_id: str | None = None
+    if qid_or_text in id_to_row:
+        input_id = qid_or_text
+        row = get_question(qid_or_text, db_path=db_path)
+        bm_text = _embed_text_input(
+            row["topic"], row["subtopic"], row["question_text"]
+        )
+    else:
+        bm_text = qid_or_text
+
+    # Dense ranking. similar_to already excludes exclude_ids and the input id.
+    dense = similar_to(
+        qid_or_text,
+        k=overfetch,
+        exclude_ids=exclude,
+        db_path=db_path,
+        index_path=index_path,
+        ids_path=ids_path,
+    )
+    dense_ids = [qid for qid, _ in dense]
+
+    # Sparse ranking (BM25 does not exclude; we drop unwanted ids after fusion).
+    sparse_ids = bm25_search(bm_text, overfetch, db_path=db_path)
+
+    # RRF fuse on rank only.
+    scores: dict[str, float] = {}
+    for rank, qid in enumerate(dense_ids, start=1):
+        scores[qid] = scores.get(qid, 0.0) + 1.0 / (kk + rank)
+    for rank, qid in enumerate(sparse_ids, start=1):
+        scores[qid] = scores.get(qid, 0.0) + 1.0 / (kk + rank)
+
+    drop = set(exclude)
+    if input_id is not None:
+        drop.add(input_id)
+
+    fused = [(qid, sc) for qid, sc in scores.items() if qid not in drop]
+    # DETERMINISM: RRF scores cluster tightly and ties are common at this N.
+    # Break ties by qid so equal scores order deterministically.
+    fused.sort(key=lambda p: (-p[1], p[0]))
+    return fused[:k]

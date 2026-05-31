@@ -133,6 +133,23 @@ def main() -> None:
     )
     conn.commit()
 
+    # --- BM25 sparse index (FTS5), built in the same wipe-and-rebuild pass ---
+    # Standalone (non-external-content) FTS5: the PK is a TEXT id, so external-
+    # content mode (which keys on an int rowid) does not fit. search_text is
+    # populated with the SAME composed string that gets embedded (see
+    # embed_inputs), so the dense and sparse sides index identical text and RRF
+    # fusion stays symmetric. No porter stemmer: keep entity tokens exact.
+    conn.execute(
+        "CREATE VIRTUAL TABLE questions_fts USING fts5("
+        "qid UNINDEXED, search_text, "
+        "tokenize='unicode61 remove_diacritics 2')"
+    )
+    conn.executemany(
+        "INSERT INTO questions_fts (qid, search_text) VALUES (?, ?)",
+        embed_inputs,
+    )
+    conn.commit()
+
     print(f"Loading embedding model: {EMBED_MODEL}")
     model = SentenceTransformer(EMBED_MODEL)
     texts = [t for _, t in embed_inputs]
@@ -162,6 +179,7 @@ def main() -> None:
     sub_count = conn.execute(
         "SELECT COUNT(*) FROM questions WHERE kind='context_sub'"
     ).fetchone()[0]
+    fts_count = conn.execute("SELECT COUNT(*) FROM questions_fts").fetchone()[0]
     conn.close()
 
     elapsed = time.time() - t0
@@ -169,6 +187,7 @@ def main() -> None:
     print(f"context_groups rows : {cg_count}")
     print(f"questions rows      : {total} (standalone={sa_count}, context_sub={sub_count})")
     print(f"faiss vectors       : {index.ntotal} (dim={dim})")
+    print(f"fts5 rows           : {fts_count}")
     print(f"db                  : {DB_PATH}")
     print(f"index               : {INDEX_PATH}")
     print(f"build time          : {elapsed:.2f}s")

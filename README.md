@@ -325,6 +325,7 @@ from retrieve import (
     filter_questions, get_question,
     get_context_group, filter_context_groups,
     similar_to, find_duplicates,
+    bm25_search, hybrid_search,
 )
 ```
 
@@ -373,6 +374,32 @@ Semantic search. Returns `[(question_id, cosine_score)]`.
 - Input id auto-excluded from its own neighbours.
 - Overfetches to keep `len(result) == k` even after exclusions / min_score.
 
+### `bm25_search(text, k)`
+
+Sparse lexical search over the FTS5 index (`questions_fts`). Returns a plain
+list of `qid`s, most relevant first. Raw text is sanitized into a safe MATCH
+expression: tokenized to word chars, each token double-quoted, joined with
+`OR` (so long questions don't require every term to be present). Note SQLite's
+`bm25()` returns *negative* scores (more negative = more relevant), so the
+query orders `ASC`.
+
+### `hybrid_search(qid_or_text, k=10, exclude_ids=None, kk=60, overfetch=50)`
+
+Dense (FAISS) + sparse (BM25) retrieval fused with **Reciprocal Rank Fusion**.
+Returns `[(question_id, rrf_score)]`, mirroring `similar_to`'s shape.
+
+- The bank is entity-heavy (Article numbers, *Lok Sabha*, *Election
+  Commission*); dense embeddings smear exact terms, so BM25 recovers the exact
+  matches FAISS misses.
+- Fuses on **rank only** — both score scales (cosine `0..1`, bm25 negative) are
+  discarded: `score(q) = Σ 1/(kk + rank)` over both lists. `kk=60` is the
+  standard constant (Cormack et al., 2009).
+- If the arg is a stored id, both sides reuse it (dense reconstructs the stored
+  vector; sparse uses the same composed string that was embedded). Otherwise the
+  raw text is embedded/tokenized on the fly.
+- Excludes `exclude_ids` and the input id itself. Ties (common at this N) break
+  by `qid` for deterministic ordering.
+
 ### `find_duplicates(threshold=0.9)`
 
 Whole-bank pairwise cosine scan. Returns `[(id_a, id_b, score)]` with
@@ -409,9 +436,13 @@ for slot in blueprint:
 Structured pool, then reject any candidate too close to something already
 in the paper.
 
+Run the neighbour check through `hybrid_search` so a candidate that shares
+exact rare tokens with an already-placed question (e.g. the same Article
+number) is caught even when MiniLM rated it only moderately similar.
+
 ```python
 candidate = pool[0]
-neighbours = similar_to(candidate["id"], k=10, min_score=0.85)
+neighbours = hybrid_search(candidate["id"], k=10)
 if any(nid in already_used for nid, _ in neighbours):
     continue   # reject, try next
 ```
@@ -422,7 +453,7 @@ FAISS can't filter by `class`/`marks`; SQL can't rank by similarity. Compose
 them: semantic first (ranked), hard filter second (binary set intersection).
 
 ```python
-candidates = similar_to("MCQ-001", k=50, exclude_ids=already_used)
+candidates = hybrid_search("MCQ-001", k=50, exclude_ids=already_used)
 allowed = {r["id"] for r in filter_questions(type="MCQ", marks=1, class_="X")}
 picks = [(qid, s) for qid, s in candidates if qid in allowed][:5]
 ```
