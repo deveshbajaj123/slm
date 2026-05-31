@@ -1,216 +1,328 @@
-# LMB History & Civics — RAG Storage Layer
+# LMB History & Civics — RAG Retrieval Layer
 
-A retrieval layer over the La Martiniere For Boys (Kolkata) History & Civics
-past-paper question bank. Turns a single enriched JSON file into a queryable
-**SQLite + FAISS** store that a downstream paper-generation pipeline can hit
-without touching the raw JSON.
+A storage-and-retrieval layer over a bank of **501 La Martiniere History & Civics
+exam questions**. It turns one source JSON file into two parallel indexes — a
+**SQLite** database and a **FAISS** vector index — and provides query helpers
+for both exact filtering and meaning-based similarity, fused via hybrid search.
 
-> **Scope is deliberately narrow.** This repo builds and queries the indexes.
-> It does **not** generate papers, call any LLM, or expose a web API.
+> **Scope is deliberately narrow.** This repo builds and queries the indexes. It
+> does **not** generate exam papers, call any LLM, or expose a web API.
 
----
-
-## Table of contents
-
-- [What this project is](#what-this-project-is)
-- [What it is *not*](#what-it-is-not)
-- [The dataset](#the-dataset)
-- [Architecture](#architecture)
-- [Repo layout](#repo-layout)
-- [Install & build](#install--build)
-- [How the builder works](#how-the-builder-works)
-- [Query API](#query-api)
-- [Retrieval patterns](#retrieval-patterns)
-- [Database schema](#database-schema)
-- [Vector index](#vector-index)
-- [Smoke test](#smoke-test)
-- [Design decisions](#design-decisions)
-- [When to outgrow this](#when-to-outgrow-this)
-- [Troubleshooting](#troubleshooting)
+This README explains the code and the retrieval process in full, defining every
+technical term as it comes up. Run order: `pip install -r requirements.txt`,
+then `python build_index.py`, then query via `retrieve.py` or run
+`python eval_hybrid.py`.
 
 ---
 
-## What this project is
+## 1. The big picture
 
-A two-stage index built from one source file:
+You have **501 exam questions** in a JSON file. The system turns them into two
+parallel indexes so downstream code can ask two different kinds of question:
+
+- **"Give me all 1-mark MCQs for Class X"** → a *structured filter* (a plain
+  database query).
+- **"Find questions that mean the same thing as this one"** → a *similarity
+  search* (needs math on meaning).
+
+The project builds those indexes and provides helper functions to query them. It
+does **not** generate papers or call any LLM — it is purely the
+storage-and-retrieval layer.
+
+Two storage technologies are used together:
+
+| Store | What it holds | Good at |
+|-------|---------------|---------|
+| **SQLite** (`questions.db`) | All readable metadata (text, marks, topic, class, year…) + the BM25 full-text index | Exact filtering: "where marks = 1 and class = X" |
+| **FAISS** (`faiss.index`) | Only numbers — one *vector* per question | Meaning-based similarity |
+
+A small JSON file (`faiss_ids.json`) is the bridge between them.
 
 ```
-lmb_history_civics_question_bank_enriched.json    ← canonical source
-                 │
-                 ▼
-           build_index.py
-                 │
-        ┌────────┴────────┐
-        ▼                 ▼
-   SQLite DB          FAISS index
-   (metadata,         (semantic
-    filters)           similarity)
-        │                 │
-        └────────┬────────┘
-                 ▼
-           retrieve.py
-        (query helpers,
-         no LLM calls)
+JSON ──build_index.py──┬─► SQLite: metadata + questions_fts (BM25 / sparse)
+                       └─► FAISS:  384-dim vectors (dense) + faiss_ids.json bridge
+
+query ──hybrid_search──┬─► dense:  embed → FAISS → top-50 by cosine ──┐
+                       └─► sparse: tokenize → FTS5 → top-50 by BM25 ──┤
+                                                                       ▼
+                                                    RRF fuse on rank (kk=60)
+                                                                       ▼
+                                          exclude + deterministic sort → top-k
 ```
-
-Downstream code gets two primitives:
-
-1. **Structured filter** — "give me all 1-mark MCQs for Class X, difficulty=easy."
-2. **Semantic search** — "find the 5 questions closest in meaning to this one."
-
-Everything else (paper blueprinting, weighted sampling, LLM drafting) lives
-outside this repo.
-
-## What it is *not*
-
-- Not a paper generator. No blueprint logic, no sampling, no LLM.
-- Not a web service. No FastAPI, no REST, no auth.
-- Not a migration-managed DB. The builder wipes `data/` and rebuilds on
-  every run. There is no schema evolution path — the source JSON *is* the
-  migration.
-- Not an ORM project. Raw SQL via `sqlite3`, parameterized with `?`.
-- Not a multi-process store. SQLite file + FAISS file, both local.
 
 ---
 
-## The dataset
+## 2. Core concepts (the vocabulary)
 
-**Source:** `lmb_history_civics_question_bank_enriched.json`
-**Coverage:** 2022-23 → 2024-25 past papers, classes VI–XI.
+**Embedding / vector.** A neural network reads a question's text and outputs a
+list of 384 numbers, e.g. `[0.02, -0.15, 0.33, …]`. That list is the
+**embedding** (a.k.a. **vector**). The key property: questions with *similar
+meaning* get *similar number-lists*, even if they share no words. The model used
+is **MiniLM-L6-v2**, a small, fast sentence-embedding model — "384-dim" means
+each vector has 384 components; "L6" means 6 transformer layers.
 
-### Top-level shape
+**Dimension (dim).** The length of the vector — 384 numbers. Picture each vector
+as a point in 384-dimensional space (impossible to visualize, but the math works
+the same as 2D or 3D).
 
-```json
-{
-  "metadata": { ... },
-  "standalone_questions": [ ...315 items... ],
-  "context_groups":       [ ...58 items... ]
-}
-```
+**Cosine similarity.** The standard measure of how "close in meaning" two vectors
+are. It is the cosine of the angle between them: **1.0** = same direction
+(identical meaning), **0** = perpendicular (unrelated), **−1** = opposite. The
+code makes this cheap via **L2-normalization**: every vector is scaled to length
+1. Once all vectors have length 1, the **dot product** (multiply components
+pairwise, then sum — also called **inner product**) equals the cosine. So
+similarity becomes a single fast multiplication.
 
-### A standalone question
+**FAISS** (Facebook AI Similarity Search). A C++ library for storing many
+vectors and finding the nearest ones to a query, fast. The index type here is
+**`IndexFlatIP`**:
 
-Self-contained; has a `type` and `marks`.
+- *Flat* = brute force: it compares the query against all 501 vectors, no
+  approximation. At this scale it is sub-millisecond and exact every time
+  (important for reproducibility).
+- *IP* = Inner Product, which (because vectors are normalized) equals cosine.
+- The alternative, **ANN** (Approximate Nearest Neighbor — index types like
+  HNSW/IVF), trades exactness for speed and is only worth it at hundreds of
+  thousands of vectors. Overkill here.
 
-```json
-{
-  "id": "MCQ-001",
-  "type": "MCQ",
-  "marks": 1,
-  "question": "When a large number of voters choose their representatives...",
-  "source": {
-    "school": "La Martiniere For Boys, Kolkata",
-    "class": "IX",
-    "exam_type": "Annual",
-    "year": "2024-25"
-  },
-  "topic": "Elections",
-  "subtopic": "Types of Election",
-  "difficulty": "easy",
-  "bloom_level": "recall"
-}
-```
+**BM25.** A classic **lexical** (word-matching) ranking formula from search
+engines. It scores a document by how often the query's words appear, down-weights
+common words ("the", "of") and up-weights rare ones. The intuition: rare exact
+terms like *Lok Sabha*, *Article 356*, *Election Commissioner* are exactly what
+embeddings tend to "smear" (blur with related concepts), whereas BM25 matches
+them literally. **IDF** (Inverse Document Frequency) is BM25's "rarer word = more
+important" component.
 
-Optional extras on some rows: `options` (for MCQs), `note`.
+**FTS5** (Full-Text Search version 5). A search engine built *into* SQLite — no
+extra library to install. It tokenizes text, builds an inverted index, and
+provides the `bm25()` ranking function. This is why "no new dependency" holds:
+FTS5 ships with SQLite, which ships with Python.
 
-### A context group
+**Tokenize.** Split text into searchable units ("words"). The config
+`unicode61 remove_diacritics 2` means: Unicode-aware word splitting, with accent
+marks stripped (so "café" matches "cafe"). Deliberately **no porter stemmer** — a
+stemmer would chop "elections" → "elect", blurring distinct entity terms. Keeping
+tokens exact is the whole point.
 
-A shared stimulus (thematic prompt, image, map, or quote) with linked
-sub-questions. Sub-questions inherit `topic` and source fields from the
-group; they have no `type` of their own.
-
-```json
-{
-  "id": "CG-001",
-  "context_type": "thematic",
-  "context_description": "Mandate of Lok Sabha Election 2024...",
-  "topic": "Elections – Election Commission",
-  "total_marks": 10,
-  "source": { "class": "IX", "year": "2024-25", ... },
-  "questions": [
-    { "id": "CG-001_Q1", "sub_label": "i",  "marks": 3, "question": "...",
-      "difficulty": "medium", "bloom_level": "recall" },
-    { "id": "CG-001_Q2", "sub_label": "ii", "marks": 3, "question": "...", ... },
-    { "id": "CG-001_Q3", "sub_label": "iii","marks": 4, "question": "...", ... }
-  ]
-}
-```
-
-### Value domains
-
-| Field         | Values                                                               |
-|---------------|----------------------------------------------------------------------|
-| `type`        | MCQ · Short Answer · Long Answer · Fill in the Blank · Identify · True/False · Definition |
-| `context_type`| thematic · image · map · quote                                       |
-| `class`       | VI · VII-VIII · IX · X · XI                                          |
-| `year`        | `YYYY-YY` academic format (e.g. `2024-25`), or `"Unknown"`           |
-| `difficulty`  | easy · medium · hard                                                 |
-| `bloom_level` | recall · understand · apply · analyze                                |
-| `exam_type`   | Annual (predominant)                                                 |
-
-### ID conventions
-
-- Standalone: `{TYPE}-NNN` — e.g. `MCQ-001`, `DEF-007`, `ID-024`.
-- Group: `CG-NNN` — e.g. `CG-042`.
-- Sub-question: `{CG-id}_Q{n}` — e.g. `CG-001_Q3`.
-
-### Quirks worth knowing
-
-- **Duplicates exist in the source.** `find_duplicates(0.95)` surfaces 21
-  pairs, several at cosine 1.0 (e.g. `DEF-002`/`DEF-007`,
-  `MCQ-014`/`MCQ-090`). Preserved, not hidden.
-- `subtopic` is only populated on standalone rows — always `None` on
-  sub-questions.
-- Some `year` values are the literal string `"Unknown"`.
+**RRF** (Reciprocal Rank Fusion). The method for *combining* the two rankings
+(dense + sparse) into one. See [section 5](#5-the-hybrid-retrieval-process--hybrid_search).
 
 ---
 
-## Architecture
+## 3. The build process — `build_index.py`
 
-### Two stores, one identity graph
+A one-shot script: run it and it wipes `data/` and rebuilds everything from the
+JSON. "Wipe-and-rebuild" means there is no incremental update or migration logic
+— the JSON is the single source of truth and the whole index regenerates in
+~10s.
+
+1. **Wipe and reload.** Delete `data/`, recreate it. Load the source JSON. If a
+   row is missing an expected field, `raise` with that row's id — never silently
+   skip bad data ("fail loud").
+
+2. **Build the SQL rows.** The JSON has two shapes: *standalone questions*
+   (self-contained, e.g. `MCQ-001`) and *context groups* (a shared stimulus — a
+   map, quote, passage — with sub-questions, e.g. `CG-001_Q1`). The builder
+   **flattens** sub-questions into first-class rows in the `questions` table
+   (`kind='context_sub'`, with a foreign key back to the group), so every
+   question is queryable uniformly without a JOIN.
+
+3. **The composed embedding string.** The crucial bit. For each question the
+   builder constructs one string — `embed_text()` in
+   [build_index.py](build_index.py):
+
+   ```
+   "{topic} — {subtopic}: {question_text}"
+   ```
+
+   Missing parts drop cleanly (no literal `"None"` ever appears). Each pair
+   `(qid, composed_string)` is collected into the list `embed_inputs`. **This
+   list is reused for both dense and sparse**, guaranteeing both sides index
+   *identical text*.
+
+4. **Insert into SQLite.** `executemany` runs one parameterized `INSERT` per row
+   in a batch. "Parameterized" = values passed via `?` placeholders, not
+   string-concatenated — prevents SQL injection and quoting bugs.
+
+5. **Build the FTS5 (BM25 / sparse) table:**
+
+   ```sql
+   CREATE VIRTUAL TABLE questions_fts USING fts5(
+       qid UNINDEXED, search_text,
+       tokenize='unicode61 remove_diacritics 2');
+   ```
+
+   - `qid UNINDEXED` — store the id but don't full-text-search it.
+   - `search_text` — the searchable column, populated from the **same
+     `embed_inputs` list** via `executemany`.
+   - It is a **standalone** (non-external-content) FTS5 table: it keeps its own
+     copy of the text. The "external-content" alternative keys off an integer
+     rowid pointing into another table, but here the primary key is a *text* id
+     (`MCQ-001`), so standalone is the natural fit.
+
+6. **Build the dense (FAISS) index.** Load MiniLM, encode all 501 composed
+   strings in one batch into a `(501, 384)` float32 array with
+   `normalize_embeddings=True` (the L2-normalization trick). Then
+   `IndexFlatIP(384)`, `.add(vectors)`, write to disk. Write `faiss_ids.json` —
+   the list of qids **in the exact order vectors were added**, so FAISS row 0 ↔
+   `ids[0]` ↔ `MCQ-001`. This list is the only bridge from a FAISS row number
+   back to a question id.
+
+7. **Print a summary**, including `fts5 rows` and `faiss vectors` — both must
+   equal 501. That equality is the integrity check that dense and sparse cover
+   the same corpus.
+
+---
+
+## 4. The query helpers — `retrieve.py`
+
+**Caching helpers.** `load_index()` reads the FAISS file plus the id list and
+builds `id_to_row` (a dict mapping `qid → row number`, the reverse of
+`faiss_ids.json`). It is wrapped in `@lru_cache` — **memoization**, so the result
+is computed once and reused across queries. `_model()` similarly loads MiniLM
+once.
+
+**`filter_questions(...)`** — pure SQL. Builds a `WHERE` clause from whatever
+filters you pass (each may be a scalar or a list → `IN (...)`). No vectors. This
+is the "structured filter" primitive.
+
+**`similar_to(qid_or_text, k)`** — the **dense** search:
+
+1. If the argument is a known qid, look up its row and call
+   `index.reconstruct(row)` — fetch the *already-stored* vector, no re-encoding.
+   If it is raw text, encode it on the fly with MiniLM.
+2. `index.search(vec, want)` — FAISS returns the `want` nearest rows and their
+   cosine scores.
+3. **Overfetch:** ask for more than `k` (`k + exclusions + 1`) so that after
+   dropping the query itself and any `exclude_ids`, a full `k` results remain.
+   "Overfetch" = retrieve extra candidates to survive later filtering.
+4. Returns `[(qid, cosine_score)]`.
+
+**`bm25_search(text, k)`** — the **sparse** search:
+
+```sql
+SELECT qid FROM questions_fts WHERE questions_fts MATCH ?
+ORDER BY bm25(questions_fts) ASC LIMIT ?;
+```
+
+- `MATCH` is FTS5's search operator.
+- SQLite's `bm25()` returns **negative** numbers (more negative = more relevant),
+  so `ORDER BY … ASC` puts the best matches first.
+- Raw text must be **sanitized** into a safe MATCH expression first
+  (`_sanitize_fts_query()`), because raw question text contains characters FTS5
+  treats as operators (quotes, `*`, `:`, the words AND/OR/NEAR). The sanitizer:
+  - `re.findall(r"\w+", text.lower())` — extract word-character tokens, lowercase.
+  - Wrap each token in double quotes (so each is a literal, not an operator).
+  - Join with `OR`, **not** `AND`. `AND` would require *every* word present,
+    destroying recall on long questions. `OR` means "match any of these terms"
+    and lets BM25 rank by how many / how rare the matches are.
+  - Empty input → `'""'`, a query that matches nothing.
+- Returns a plain list of qids, best first.
+
+---
+
+## 5. The hybrid retrieval process — `hybrid_search`
+
+The heart of the system. It runs *both* searches and fuses them.
+
+**Step 1 — resolve the query for both sides symmetrically.**
+
+- If the argument is a stored qid: the dense side reconstructs its stored vector,
+  and the sparse side reuses the **same composed string** that was embedded
+  (rebuilt via `_embed_text_input`). Both sides see identical input.
+- If it is raw text: both sides take the raw text (dense embeds it, sparse
+  tokenizes it).
+
+**Step 2 — get two ranked lists**, each at `overfetch=50` candidates:
+`dense_ids` from `similar_to`, `sparse_ids` from `bm25_search`.
+
+**Step 3 — Reciprocal Rank Fusion (RRF).** The critical design choice: **fuse on
+rank only, ignore the actual scores.** Why? The two scores live on incompatible
+scales — cosine is `0..1`, BM25 is some negative number — and normalizing across
+them is fragile. Rank (1st, 2nd, 3rd…) is comparable across both. The formula:
 
 ```
-           ┌──────────────────────────────────┐
-           │  questions.db  (SQLite)          │
-           │                                  │
-           │  questions(id PK, kind, type,    │
-           │    marks, question_text, topic,  │
-           │    subtopic, difficulty,         │
-           │    bloom_level, class, year,     │
-           │    exam_type, school,            │
-           │    context_group_id FK,          │
-           │    sub_label, text_hash)         │
-           │                                  │
-           │  context_groups(id PK, ...)      │
-           └──────────────┬───────────────────┘
-                          │ qid
-           ┌──────────────┴───────────────────┐
-           │  faiss_ids.json                  │
-           │  ["MCQ-001", "MCQ-002", ...]     │
-           │   ↑ row index = list position    │
-           └──────────────┬───────────────────┘
-                          │ row_idx
-           ┌──────────────┴───────────────────┐
-           │  faiss.index  (IndexFlatIP)      │
-           │  501 vectors × 384 dims (fp32)   │
-           │  L2-normalized (cosine == IP)    │
-           └──────────────────────────────────┘
+score(q) = Σ over each list of   1 / (kk + rank)        # rank is 1-based
 ```
 
-FAISS stores **only vectors**. Every piece of human-readable metadata lives
-in SQLite. The JSON sidecar is the bridge between a FAISS row number and a
-question id.
+- `rank` is the 1-based position of question `q` in a list.
+- `kk = 60` is a **damping constant** (the standard value from Cormack et al.,
+  2009). It softens the gap between top ranks — without it, rank 1 would utterly
+  dominate rank 2. With `kk=60`, rank 1 contributes `1/61`, rank 2 `1/62`, etc. —
+  close together, so a question that ranks *decently in both* lists can beat one
+  that ranks 1st in only one. That is the point of fusion: reward agreement
+  across methods.
+- A question appearing in both lists gets *both* contributions added → it floats
+  to the top. This is how BM25's exact-term hit rescues something dense ranked
+  low.
 
-### Full query round-trip
+**Step 4 — exclude and sort.** Drop the input id and any `exclude_ids`, then:
 
-`similar_to("MCQ-001", k=3)`:
+```python
+fused.sort(key=lambda p: (-p[1], p[0]))   # score desc, then qid asc
+```
 
-1. Look up `"MCQ-001"` in `faiss_ids.json` → row `0`.
-2. `index.reconstruct(0)` → the 384-dim vector (no re-embedding).
-3. `index.search(vec, k + overfetch)` → row indices + cosine scores.
-4. Map row indices back to qids via the JSON list.
-5. Drop excluded ids (incl. self), drop below `min_score`, truncate to `k`.
-6. (Optional) For each qid, `SELECT * FROM questions WHERE id = ?` in SQLite.
+Breaking ties by qid makes the output **deterministic** — identical every run,
+which matters for reproducible builds and tests (at N=501 the RRF scores cluster
+tightly and ties are common). Returns the top `k` as `[(qid, rrf_score)]`.
+
+**Concrete example** — the raw query `"Gram Sabha tenure five years"`:
+
+- Dense ranks `MCQ-084` *below* position 5 (a short query gives MiniLM little to
+  work with, and it blurs "Gram Sabha" with general local-government concepts).
+- BM25 ranks `MCQ-084` high because it literally contains the rare tokens "gram"
+  and "sabha".
+- RRF adds both contributions → `MCQ-084` jumps into the top 5. Dense alone
+  missed it; hybrid caught it. That is the +0.08 recall@5 win the eval measures.
+
+---
+
+## 6. The evaluation — `eval_hybrid.py`
+
+**Recall@k** is the metric. For a "seed" question with a known set of
+truly-relevant neighbours:
+
+```
+recall@k = (relevant items found in the top k) / (total relevant items)
+```
+
+Recall@5 = 1.0 means all the relevant ones made it into the top 5. (Recall
+measures "did we find them"; it does not penalize extra junk — that would be
+*precision*.)
+
+The script compares **dense-only** (`similar_to`) vs **hybrid**
+(`hybrid_search`) on two hand-labelled sets:
+
+- **Stored-id seeds** — seed from an existing question (reuses stored vector +
+  text).
+- **Raw-text queries** — typed-out strings (exercises the on-the-fly
+  embed/tokenize path, the realistic "user types a question" case).
+
+**The honest finding:** on this 501-question bank, dense embeddings are already
+so strong that hybrid is **break-even on id-seeded reuse** (occasionally slightly
+worse at @5) and a **small win (+0.08 recall@5) on short raw-text entity
+queries**. The "BM25 IDF is noisy at small N" caveat is expected, not a bug —
+with only 501 documents, the rare-word statistics BM25 relies on are thin.
+
+```
+==== mean recall@k, stored-id seeds (21) ====
+  @5   dense=0.976  hybrid=0.952  delta=-0.024
+  @10  dense=1.000  hybrid=1.000  delta=+0.000
+
+==== mean recall@k, raw-text queries (6) ====
+  @5   dense=0.861  hybrid=0.944  delta=+0.083
+  @10  dense=1.000  hybrid=1.000  delta=+0.000
+```
+
+---
+
+## Summary
+
+Dense answers "what *means* the same"; sparse answers "what *says* the same
+word"; RRF lets a result win if *either* method is confident, and especially if
+*both* are. The retrieval layer is intentionally complete at these two primitives
+— exact filtering and similarity — and stops there; paper generation, sampling,
+and drafting live outside this repo.
 
 ---
 
@@ -219,448 +331,24 @@ question id.
 ```
 .
 ├── lmb_history_civics_question_bank_enriched.json   # canonical source (never modified)
-├── build_index.py          # one-shot: JSON → SQLite + FAISS
-├── retrieve.py             # query helpers, no LLM
-├── schema.sql              # readable copy of the SQLite schema
-├── requirements.txt        # pinned deps
-├── README.md               # this file
-└── data/                   # generated; wiped & rebuilt every run
-    ├── questions.db
-    ├── faiss.index
-    └── faiss_ids.json
+├── build_index.py     # one-shot: JSON → SQLite + FAISS + FTS5
+├── retrieve.py        # query helpers (filter / similar_to / bm25_search / hybrid_search)
+├── eval_hybrid.py     # recall@k: dense-only vs hybrid
+├── schema.sql         # readable copy of the SQLite schema
+├── requirements.txt   # pinned deps (faiss-cpu, sentence-transformers, numpy)
+└── data/              # generated; wiped & rebuilt every run — NOT committed
+    ├── questions.db   #   SQLite: questions, context_groups, questions_fts
+    ├── faiss.index    #   501 vectors × 384 dims
+    └── faiss_ids.json #   row-index → qid bridge
 ```
 
-`data/` is disposable. Treat it as a build artifact — do not hand-edit,
-do not commit to long-lived branches, rebuild whenever the JSON changes.
-
----
-
-## Install & build
-
-Requires **Python 3.11+**.
-
-```bash
-pip install -r requirements.txt
-python build_index.py
-```
-
-Expected output:
-
-```
-Loading embedding model: sentence-transformers/all-MiniLM-L6-v2
-Embedding 501 question texts...
----- build summary ----
-context_groups rows : 58
-questions rows      : 501 (standalone=315, context_sub=186)
-faiss vectors       : 501 (dim=384)
-db                  : .../data/questions.db
-index               : .../data/faiss.index
-build time          : ~11s
-```
-
-Pinned deps (see `requirements.txt`):
-
-- `faiss-cpu==1.8.0` — vector index
-- `sentence-transformers==3.0.1` — embedding model loader
-- `numpy==1.26.4` — pinned for faiss-cpu wheel compatibility
-
----
-
-## How the builder works
-
-`build_index.py` is a single linear script. No CLI flags.
-
-1. **Wipe.** Delete `data/` if present, recreate it empty.
-2. **Load source JSON.** Raise immediately if the file is missing.
-3. **Open SQLite** (`data/questions.db`), turn foreign keys on, execute
-   `schema.sql`.
-4. **Validate and transform each row.** Required-field sets are checked
-   explicitly. If any row is missing an expected field, raise with the
-   offending id — malformed rows are never silently skipped.
-5. **Insert via `executemany`** — one batch for `context_groups`, one for
-   `questions`. Sub-questions are promoted to first-class rows in
-   `questions` with `kind='context_sub'` and inherit the group's topic and
-   source fields.
-6. **Load the embedding model** (`all-MiniLM-L6-v2`, downloads on first
-   run, ~90 MB).
-7. **Encode all 501 question strings in one batch** with
-   `normalize_embeddings=True` → `(501, 384)` float32 array.
-8. **Build the FAISS index**: `IndexFlatIP(384)`, `.add(vectors)`,
-   `faiss.write_index(...)`.
-9. **Write `faiss_ids.json`** — same order as vectors were added.
-10. **Print summary.** Row counts per table, vector count, wall-clock time.
-
-### Embedding input format
-
-```
-"{topic} — {subtopic}: {question_text}"
-```
-
-Missing parts drop cleanly — no literal `"None"` ever appears in the
-embedded text.
-
-Examples:
-
-```
-Elections — Types of Election: When a large number of voters choose...
-Parliament: During the proclamation of Emergency, the ______ guaranteed...   # no subtopic
-When the constitution was written, ...                                        # no topic
-```
-
-### `text_hash`
-
-Stored per row. SHA-1 of the question text after lowercasing, collapsing
-whitespace, and stripping trailing punctuation. Used for cheap exact-match
-duplicate detection (a cheaper alternative to semantic dedupe).
-
----
-
-## Query API
-
-From `retrieve.py`. All functions accept optional `db_path` / `index_path`
-overrides; default to `data/` in the repo root.
-
-```python
-from retrieve import (
-    filter_questions, get_question,
-    get_context_group, filter_context_groups,
-    similar_to, find_duplicates,
-    bm25_search, hybrid_search,
-)
-```
-
-### `filter_questions(...)`
-
-Structured SQL filter. Every filter accepts either a scalar or a list.
-
-```python
-filter_questions(
-    *, type=None, marks=None, class_=None, year=None,
-    topic=None, difficulty=None, bloom_level=None,
-    kind=None,                    # 'standalone' | 'context_sub' | None (both)
-    exclude_ids=None, limit=None,
-) -> list[dict]
-```
-
-### `get_question(qid)`
-
-Single row as a dict, or `None`.
-
-### `get_context_group(cg_id, include_questions=True)`
-
-Returns the group row plus its sub-questions ordered by `sub_label`.
-Pass `include_questions=False` for a light-weight lookup.
-
-### `filter_context_groups(...)`
-
-```python
-filter_context_groups(
-    *, class_=None, year=None, topic=None,
-    total_marks=None,             # int (exact) or (min, max) tuple
-    exclude_ids=None,
-) -> list[dict]
-```
-
-Does **not** include sub-questions in the result (keep it cheap; call
-`get_context_group` if you need them).
-
-### `similar_to(qid_or_text, k=10, exclude_ids=None, min_score=None)`
-
-Semantic search. Returns `[(question_id, cosine_score)]`.
-
-- If the argument matches an existing id, reuses the stored embedding via
-  `index.reconstruct` (no re-encoding).
-- Otherwise, embeds the raw text on the fly with the same model.
-- Input id auto-excluded from its own neighbours.
-- Overfetches to keep `len(result) == k` even after exclusions / min_score.
-
-### `bm25_search(text, k)`
-
-Sparse lexical search over the FTS5 index (`questions_fts`). Returns a plain
-list of `qid`s, most relevant first. Raw text is sanitized into a safe MATCH
-expression: tokenized to word chars, each token double-quoted, joined with
-`OR` (so long questions don't require every term to be present). Note SQLite's
-`bm25()` returns *negative* scores (more negative = more relevant), so the
-query orders `ASC`.
-
-### `hybrid_search(qid_or_text, k=10, exclude_ids=None, kk=60, overfetch=50)`
-
-Dense (FAISS) + sparse (BM25) retrieval fused with **Reciprocal Rank Fusion**.
-Returns `[(question_id, rrf_score)]`, mirroring `similar_to`'s shape.
-
-- The bank is entity-heavy (Article numbers, *Lok Sabha*, *Election
-  Commission*); dense embeddings smear exact terms, so BM25 recovers the exact
-  matches FAISS misses.
-- Fuses on **rank only** — both score scales (cosine `0..1`, bm25 negative) are
-  discarded: `score(q) = Σ 1/(kk + rank)` over both lists. `kk=60` is the
-  standard constant (Cormack et al., 2009).
-- If the arg is a stored id, both sides reuse it (dense reconstructs the stored
-  vector; sparse uses the same composed string that was embedded). Otherwise the
-  raw text is embedded/tokenized on the fly.
-- Excludes `exclude_ids` and the input id itself. Ties (common at this N) break
-  by `qid` for deterministic ordering.
-
-### `find_duplicates(threshold=0.9)`
-
-Whole-bank pairwise cosine scan. Returns `[(id_a, id_b, score)]` with
-`id_a < id_b`, sorted by score descending. Single matmul on normalized
-vectors — fast at this scale.
-
-### `load_index(...)`
-
-Memoized helper (`@lru_cache`). Loads and caches the FAISS index and id
-list so repeated queries don't re-read the file.
-
----
-
-## Retrieval patterns
-
-Three realistic ways downstream code will consume this layer.
-
-### Pattern 1 — Blueprint-driven paper build
-
-Pure structured. No vectors.
-
-```python
-for slot in blueprint:
-    pool = filter_questions(
-        type=slot.type, marks=slot.marks, class_=slot.class_,
-        difficulty=slot.difficulty, exclude_ids=already_used,
-    )
-    picks = random.sample(pool, slot.count)
-    already_used.update(p["id"] for p in picks)
-```
-
-### Pattern 2 — Semantic dedupe during picking
-
-Structured pool, then reject any candidate too close to something already
-in the paper.
-
-Run the neighbour check through `hybrid_search` so a candidate that shares
-exact rare tokens with an already-placed question (e.g. the same Article
-number) is caught even when MiniLM rated it only moderately similar.
-
-```python
-candidate = pool[0]
-neighbours = hybrid_search(candidate["id"], k=10)
-if any(nid in already_used for nid, _ in neighbours):
-    continue   # reject, try next
-```
-
-### Pattern 3 — Hybrid: "similar, but filtered"
-
-FAISS can't filter by `class`/`marks`; SQL can't rank by similarity. Compose
-them: semantic first (ranked), hard filter second (binary set intersection).
-
-```python
-candidates = hybrid_search("MCQ-001", k=50, exclude_ids=already_used)
-allowed = {r["id"] for r in filter_questions(type="MCQ", marks=1, class_="X")}
-picks = [(qid, s) for qid, s in candidates if qid in allowed][:5]
-```
-
-### Pattern 4 — Whole-bank dedupe report
-
-```python
-pairs = find_duplicates(threshold=0.95)
-# [(id_a, id_b, score), ...] sorted by score desc
-```
-
----
-
-## Database schema
-
-Full SQL in [`schema.sql`](schema.sql).
-
-### `questions`
-
-| Column             | Type    | Notes                                          |
-|--------------------|---------|------------------------------------------------|
-| `id`               | TEXT PK | e.g. `MCQ-001`, `CG-001_Q3`                    |
-| `kind`             | TEXT    | `'standalone'` or `'context_sub'`              |
-| `type`             | TEXT    | NULL for sub-questions                         |
-| `marks`            | INTEGER | per sub-question for context subs              |
-| `question_text`    | TEXT    |                                                |
-| `topic`            | TEXT    | subs inherit from their group                  |
-| `subtopic`         | TEXT    | NULL for subs                                  |
-| `difficulty`       | TEXT    | easy · medium · hard                           |
-| `bloom_level`      | TEXT    | recall · understand · apply · analyze          |
-| `class`            | TEXT    | VI · VII-VIII · IX · X · XI                    |
-| `year`             | TEXT    | `YYYY-YY` or `"Unknown"`                       |
-| `exam_type`        | TEXT    |                                                |
-| `school`           | TEXT    |                                                |
-| `context_group_id` | TEXT FK | NULL for standalone                            |
-| `sub_label`        | TEXT    | `'i'`, `'ii'`, …; NULL for standalone          |
-| `text_hash`        | TEXT    | sha1 of normalized text                        |
-
-Indexes: `(type, marks)`, `(class, year)`, `topic`, `difficulty`,
-`bloom_level`, `text_hash`, `context_group_id`.
-
-### `context_groups`
-
-| Column                | Type    | Notes                              |
-|-----------------------|---------|------------------------------------|
-| `id`                  | TEXT PK | e.g. `CG-001`                      |
-| `context_type`        | TEXT    | thematic · image · map · quote     |
-| `context_description` | TEXT    | the stimulus itself                |
-| `topic`               | TEXT    |                                    |
-| `total_marks`         | INTEGER |                                    |
-| `class`               | TEXT    |                                    |
-| `year`                | TEXT    |                                    |
-| `exam_type`           | TEXT    |                                    |
-| `school`              | TEXT    |                                    |
-
----
-
-## Vector index
-
-| Property       | Value                                                 |
-|----------------|-------------------------------------------------------|
-| Library        | `faiss-cpu` 1.8.0                                     |
-| Index type     | `IndexFlatIP` (exact brute-force, inner product)      |
-| Vectors        | 501 (one per question; groups aren't embedded)        |
-| Dim            | 384                                                   |
-| Metric         | Cosine similarity (vectors are L2-normalized)         |
-| Model          | `sentence-transformers/all-MiniLM-L6-v2`              |
-| File           | `data/faiss.index` (~770 KB)                          |
-| Id mapping     | `data/faiss_ids.json`                                 |
-
-Why flat, not HNSW/IVF/PQ: at 501 vectors, exhaustive search is sub-
-millisecond and deterministic. ANN structures add build params, recall
-tuning, and non-determinism for no speed gain at this scale.
-
----
-
-## Smoke test
-
-Actual output from a clean build (2026-04-19):
-
-```
-### 1) filter_questions(type='MCQ', marks=1, class_='X', limit=5)
-returned 5 rows
-  MCQ-020  topic='Parliament'  text='Important subjects like Defence, Diplomatic Affairs...'
-  MCQ-021  topic='Parliament'  text='During the proclamation of Emergency, the ______ guaranteed...'
-  MCQ-022  topic='Parliament'  text='He is the defender of the government in Parliament.'
-  MCQ-023  topic='President'   text='When a money bill reaches the President...'
-  MCQ-024  topic='Judiciary'   text='Where can an appeal be made against a death punishment...'
-
-### 2) get_context_group('CG-001')
-{
-  "id": "CG-001",
-  "context_type": "thematic",
-  "context_description": "Mandate of Lok Sabha Election 2024 / Role of Election Commission",
-  "topic": "Elections – Election Commission",
-  "total_marks": 10,
-  "class": "IX",
-  "year": "2024-25",
-  "exam_type": "Annual",
-  "school": "La Martiniere For Boys, Kolkata"
-}
-  [i]   CG-001_Q1  marks=3  'What constitutes the Election Commission?...'
-  [ii]  CG-001_Q2  marks=3  'What is an election? Mention any two principles...'
-  [iii] CG-001_Q3  marks=4  'Mention the kinds of election in India?...'
-
-### 3) similar_to('MCQ-001', k=3)
-  CG-051_Q1  score=0.7804  'Explain briefly what are types of elections that can take place?'
-  MCQ-058    score=0.7587  'Mid term election takes place:'
-  MCQ-077    score=0.7566  'The election to the State Legislative Assembly is an example of'
-
-### 4) find_duplicates(threshold=0.95)
-pairs found: 21
-  DEF-002 <-> DEF-007  score=1.0000
-  MCQ-014 <-> MCQ-090  score=1.0000
-  ID-014  <-> ID-024   score=1.0000
-  ID-015  <-> ID-025   score=1.0000
-  DEF-003 <-> DEF-011  score=1.0000
-```
-
-Reproduce with:
-
-```python
-import retrieve as r
-print(r.filter_questions(type="MCQ", marks=1, class_="X", limit=5))
-print(r.get_context_group("CG-001"))
-print(r.similar_to("MCQ-001", k=3))
-print(len(r.find_duplicates(threshold=0.95)))
-```
-
----
-
-## Design decisions
-
-**Why SQLite?** Zero setup, single file, bundled with Python. 559 rows
-don't need Postgres. Trivial to swap later (`sqlite3.connect` →
-`psycopg.connect`, `?` → `%s`) if the workload ever justifies it.
-
-**Why FAISS flat?** Exact brute-force is faster than the tuning cost of
-ANN at this N. Deterministic results matter for reproducible builds.
-
-**Why MiniLM-L6-v2?** 384 dims, CPU-fine, well-studied for short-text
-semantic search. Bigger encoders (bge-large, e5-large) add latency and
-disk cost without changing retrieval quality meaningfully on 501 short
-questions.
-
-**Why promote sub-questions to first-class rows?** Paper generation
-samples at the sub-question granularity (each has its own marks and
-difficulty). A joined schema would force every query to `JOIN
-context_groups`. Flat is simpler and faster; the `context_group_id` FK
-preserves the relationship when you need it.
-
-**Why wipe-and-rebuild?** The source JSON is the source of truth. There's
-no long-lived state to migrate — every build is derivable from the JSON
-in ~11s. Avoids a whole category of migration bugs.
-
-**Why fail loud on malformed rows?** Silent skips corrupt the downstream
-pipeline without a visible signal. `build_index.py` raises with the
-offending id so data issues surface immediately.
-
-**Why no LLM here?** Separation of concerns. This layer gives the
-generation pipeline two primitives — "rows matching a spec" and "rows
-near a meaning" — and stops. Every other concern (prompt design,
-blueprint scoring, drafting, grading) is a separate problem.
-
----
-
-## When to outgrow this
-
-| Signal                                        | Next step                                           |
-|-----------------------------------------------|-----------------------------------------------------|
-| Question bank grows to 100K+                  | `IndexHNSWFlat` (still FAISS, still in-process)     |
-| Need filter-during-search (not post-filter)   | Qdrant or Weaviate (payload-aware ANN)              |
-| Multi-process / multi-tenant                  | pgvector on Postgres, or a dedicated vector DB      |
-| Want hybrid sparse+dense                      | Add SQLite FTS5 for BM25, fuse with FAISS via RRF   |
-| Schema needs to evolve in place               | Introduce proper migrations (Alembic, etc.)         |
-
-None of these are justified for 501 past-paper questions.
-
----
-
-## Troubleshooting
-
-**`ImportError: numpy.core.multiarray failed to import` when importing faiss**
-faiss-cpu 1.8.0 wheels are built against NumPy 1.x. If a NumPy 2.x is
-active, pin it down:
-
-```bash
-pip install --user --force-reinstall "numpy==1.26.4"
-```
-
-**`FileNotFoundError: data/questions.db`**
-You didn't run `python build_index.py`, or you ran it from a different
-working directory. The builder writes `data/` next to itself.
-
-**`ValueError: standalone id='...' missing fields: [...]`**
-The source JSON has a row that doesn't match the expected shape. Fix the
-JSON (the builder refuses to skip it).
-
-**Slow first build**
-First run downloads the ~90 MB MiniLM model to `~/.cache/huggingface`.
-Subsequent builds take ~11s on CPU.
-
----
+`data/` is a build artifact (gitignored). Rebuild it any time with
+`python build_index.py`.
 
 ## License / attribution
 
-Questions sourced from La Martiniere For Boys, Kolkata — History & Civics
-past papers, 2022-23 through 2024-25. All rights to the question text
-belong to the school. This repo builds an index over them; it does not
-republish them.
+Questions sourced from La Martiniere For Boys, Kolkata — History & Civics past
+papers. All rights to the question text belong to the school. This repo builds an
+index over them; it does not republish them.
+</content>
+</invoke>
